@@ -1,0 +1,13 @@
+# Build artifacts
+.venv/
+whisper.cpp/
+models/
+Plume.app/
+VoiceType.app/
+__pycache__/
+*.pyc
+AppIcon.icns
+Plume-bin
+
+# OS
+.DS_Store
