@@ -206,6 +206,7 @@ class SettingsWindowController(NSObject):
             NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False,
         )
         self.window.setTitle_("Plume Settings")
+        self.window.setReleasedWhenClosed_(False)
         self.window.center()
 
         cv = self.window.contentView()
