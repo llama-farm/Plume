@@ -130,6 +130,8 @@ DEFAULTS = {
     "auto_paste": True,
     "copy_to_clipboard": True,
     "sound_effects": True,
+    "live_transcription": False,
+    "recording_glow": True,
 }
 
 
@@ -154,7 +156,7 @@ def save(settings):
 # ── Native settings window ───────────────────────────────────
 
 W = 400
-H = 330
+H = 394
 PAD = 24
 LABEL_X = PAD
 CTRL_X = PAD
@@ -261,6 +263,18 @@ class SettingsWindowController(NSObject):
             cv, "Sound effects", y, self._settings["sound_effects"]
         )
 
+        y -= ROW_H
+        self._live_cb = self._make_toggle(
+            cv, "Type live while recording", y,
+            self._settings.get("live_transcription", False)
+        )
+
+        y -= ROW_H
+        self._glow_cb = self._make_toggle(
+            cv, "Recording glow indicator", y,
+            self._settings.get("recording_glow", True)
+        )
+
         # ── Separator ──
         y -= 20
         cv.addSubview_(_separator(y, W))
@@ -307,6 +321,8 @@ class SettingsWindowController(NSObject):
         self._settings["auto_paste"] = self._auto_paste_cb.state() == NSControlStateValueOn
         self._settings["copy_to_clipboard"] = self._clipboard_cb.state() == NSControlStateValueOn
         self._settings["sound_effects"] = self._sounds_cb.state() == NSControlStateValueOn
+        self._settings["live_transcription"] = self._live_cb.state() == NSControlStateValueOn
+        self._settings["recording_glow"] = self._glow_cb.state() == NSControlStateValueOn
         save(self._settings)
         self.window.close()
         if self._on_save:
