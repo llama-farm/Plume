@@ -1,0 +1,6 @@
+numpy
+sounddevice
+rumps
+pyobjc-framework-Quartz
+pyobjc-framework-Cocoa
+pynput

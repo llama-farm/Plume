@@ -9,5 +9,14 @@ __pycache__/
 AppIcon.icns
 Plume-bin
 
+# PyInstaller
+build/
+dist/
+*.spec
+
 # OS
 .DS_Store
+
+# Junk
+TEST.md
+qmd/

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "═══════════════════════════════════════════"
-echo "  Voice Type — Setup"
+echo "  Plume — Setup"
 echo "═══════════════════════════════════════════"
 
 # ── 1. Build whisper.cpp with Metal (GPU) support ──
@@ -26,34 +26,24 @@ else
     echo "✓ whisper.cpp already built"
 fi
 
-# ── 2. Download model (large-v3-turbo — fast + excellent technical vocabulary) ──
-MODEL_FILE="models/ggml-large-v3-turbo.bin"
-if [ ! -f "$MODEL_FILE" ]; then
-    echo ""
-    echo "▸ Downloading large-v3-turbo model (~1.6 GB)..."
-    echo "  (This model excels at technical/programming vocabulary)"
-    bash whisper.cpp/models/download-ggml-model.sh large-v3-turbo
-    mv whisper.cpp/models/ggml-large-v3-turbo.bin models/
-    echo "✓ Model downloaded"
-else
-    echo "✓ Model already downloaded"
-fi
-
-# ── 3. Python venv + dependencies ──
+# ── 2. Python venv + dependencies ──
 echo ""
 if [ ! -d ".venv" ]; then
     echo "▸ Creating Python virtual environment..."
     python3 -m venv .venv
 fi
 echo "▸ Installing Python dependencies..."
-.venv/bin/pip install --quiet sounddevice numpy pynput
+.venv/bin/pip install --quiet -r requirements.txt
 echo "✓ Python dependencies installed"
 
-# ── 4. Permissions reminder ──
+# ── 3. Permissions reminder ──
 echo ""
 echo "═══════════════════════════════════════════"
 echo "  Setup complete!"
 echo "═══════════════════════════════════════════"
+echo ""
+echo "  The speech model (~1.6 GB) will be downloaded"
+echo "  automatically on first launch."
 echo ""
 echo "  macOS permissions needed (will prompt on first run):"
 echo "    • Accessibility — for global hotkey + paste"
@@ -61,5 +51,5 @@ echo "    • Microphone    — for audio capture"
 echo ""
 echo "  Grant these in: System Settings → Privacy & Security"
 echo ""
-echo "  Run with:  ./run.sh"
+echo "  Run with:  .venv/bin/python3 app.py"
 echo "═══════════════════════════════════════════"
