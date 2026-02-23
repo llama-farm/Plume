@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import wave
 
 import numpy as np
@@ -22,22 +23,53 @@ import Quartz
 
 import settings as cfg
 
+# ── Path resolution ───────────────────────────────────────────
+
+_FROZEN = getattr(sys, "frozen", False)
+
+if _FROZEN:
+    # PyInstaller .app bundle: resources are in Contents/Resources
+    _BUNDLE_DIR = os.path.normpath(
+        os.path.join(os.path.dirname(sys.executable), "..", "Resources")
+    )
+else:
+    _BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_DATA_DIR = os.path.expanduser("~/Library/Application Support/Plume")
+os.makedirs(_DATA_DIR, exist_ok=True)
+
 # ── Configuration ──────────────────────────────────────────────
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "ggml-large-v3-turbo.bin")
+MODEL_DIR = os.path.join(_DATA_DIR, "models")
+MODEL_PATH = os.path.join(MODEL_DIR, "ggml-large-v3-turbo.bin")
+MODEL_URL = (
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+    "ggml-large-v3-turbo.bin"
+)
+
 WHISPER_SAMPLE_RATE = 16000
 CHANNELS = 1
 DEBOUNCE_SECS = 0.5
 
-_dev_info = sd.query_devices(kind="input")
-NATIVE_SAMPLE_RATE = int(_dev_info["default_samplerate"])
+def _get_native_sample_rate():
+    """Query the current default input device's sample rate."""
+    info = sd.query_devices(kind="input")
+    return int(info["default_samplerate"])
 
-_WHISPER_CANDIDATES = [
-    os.path.join(SCRIPT_DIR, "whisper.cpp", "build", "bin", "whisper-cli"),
-    os.path.join(SCRIPT_DIR, "whisper.cpp", "build", "bin", "main"),
-]
-WHISPER_BIN = next((p for p in _WHISPER_CANDIDATES if os.path.isfile(p)), None)
+
+def _find_whisper_bin():
+    """Locate whisper-cli binary in bundle or dev tree."""
+    candidates = []
+    if _FROZEN:
+        candidates.append(os.path.join(_BUNDLE_DIR, "whisper-cli"))
+    candidates.extend([
+        os.path.join(_BUNDLE_DIR, "whisper.cpp", "build", "bin", "whisper-cli"),
+        os.path.join(_BUNDLE_DIR, "whisper.cpp", "build", "bin", "main"),
+    ])
+    return next((p for p in candidates if os.path.isfile(p)), None)
+
+
+WHISPER_BIN = _find_whisper_bin()
 
 
 def _resample(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
@@ -49,6 +81,37 @@ def _resample(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray
     return np.interp(indices, np.arange(len(audio)), audio.flatten()).astype(
         np.float32
     ).reshape(-1, 1)
+
+
+# ── Model download ────────────────────────────────────────────
+
+def _download_model(progress_cb=None):
+    """Download the whisper model to MODEL_PATH. Calls progress_cb(percent)."""
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    tmp_path = MODEL_PATH + ".download"
+
+    try:
+        req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Plume/1.0"})
+        with urllib.request.urlopen(req) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(tmp_path, "wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)  # 1 MB chunks
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb and total > 0:
+                        progress_cb(int(downloaded * 100 / total))
+
+        os.rename(tmp_path, MODEL_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ── Transcription engine ──────────────────────────────────────
@@ -117,8 +180,8 @@ def play_sound(name: str):
 
 import rumps
 
-ICON_IDLE = os.path.join(SCRIPT_DIR, "icons", "menubar.png")
-ICON_REC = os.path.join(SCRIPT_DIR, "icons", "menubar-rec.png")
+ICON_IDLE = os.path.join(_BUNDLE_DIR, "icons", "menubar.png")
+ICON_REC = os.path.join(_BUNDLE_DIR, "icons", "menubar-rec.png")
 
 
 class PlumeApp(rumps.App):
@@ -140,15 +203,21 @@ class PlumeApp(rumps.App):
         self._tap_source = None
         self._tap_loop = None
         self._tap_thread = None
-        self._tap_lock = threading.Lock()
         self._settings_ctrl = None
+        self._native_rate = _get_native_sample_rate()
+        self._model_ready = os.path.isfile(MODEL_PATH)
 
         hotkey_str = cfg.format_hotkey(
             self._settings["hotkey_modifier_flags"],
             self._settings["hotkey_keycode"],
         )
 
-        self.status_item = rumps.MenuItem(f"Ready — {hotkey_str} to dictate")
+        if self._model_ready:
+            status_text = f"Ready — {hotkey_str} to dictate"
+        else:
+            status_text = "Downloading speech model..."
+
+        self.status_item = rumps.MenuItem(status_text)
         self.status_item.set_callback(None)
 
         self.menu = [
@@ -160,6 +229,32 @@ class PlumeApp(rumps.App):
         ]
 
         self._start_hotkey_listener()
+
+        if not self._model_ready:
+            threading.Thread(target=self._download_model_bg, daemon=True).start()
+
+    # ── Model download ──
+
+    def _download_model_bg(self):
+        def on_progress(pct):
+            self.status_item.title = f"Downloading speech model... {pct}%"
+
+        try:
+            _download_model(progress_cb=on_progress)
+            self._model_ready = True
+            self._set_idle("Ready")
+            rumps.notification(
+                title="Plume",
+                subtitle="Speech model downloaded",
+                message="You're all set — use your hotkey to start dictating.",
+            )
+        except Exception as e:
+            self.status_item.title = "Model download failed"
+            rumps.notification(
+                title="Plume",
+                subtitle="Model download failed",
+                message=str(e)[:200],
+            )
 
     # ── Settings ──
 
@@ -173,10 +268,6 @@ class PlumeApp(rumps.App):
     def _on_settings_saved(self, new_settings):
         self._settings = new_settings
         self._restart_hotkey_listener()
-        hotkey_str = cfg.format_hotkey(
-            self._settings["hotkey_modifier_flags"],
-            self._settings["hotkey_keycode"],
-        )
         self._set_idle("Ready")
 
     # ── Hotkey listener (Quartz CGEventTap — suppresses hotkey from reaching apps) ──
@@ -186,7 +277,7 @@ class PlumeApp(rumps.App):
         target_keycode = self._settings["hotkey_keycode"]
         target_flags = self._settings["hotkey_modifier_flags"]
         app = self
-        suppressed_keydown = [False]  # mutable for closure
+        suppressed_keydown = [False]
 
         MOD_MASK = (
             Quartz.kCGEventFlagMaskControl
@@ -195,17 +286,15 @@ class PlumeApp(rumps.App):
             | Quartz.kCGEventFlagMaskCommand
         )
 
-        # Local ref so the callback closure captures THIS tap, not whatever
-        # app._tap points to later (important after restart).
         local_tap = [None]
 
         def tap_callback(proxy, event_type, event, refcon):
-            # Re-enable if the system disabled our tap
             if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
                 tap = local_tap[0]
                 if tap is not None:
                     try:
-                        Quartz.CGEventTapEnable(tap, True)
+                        if not Quartz.CGEventTapIsEnabled(tap):
+                            Quartz.CGEventTapEnable(tap, True)
                     except Exception:
                         pass
                 return event
@@ -222,14 +311,14 @@ class PlumeApp(rumps.App):
                     if now - app.last_toggle_time >= DEBOUNCE_SECS:
                         app.last_toggle_time = now
                         threading.Thread(target=app._toggle, daemon=True).start()
-                    return None  # suppress — don't send to focused app
+                    return None
 
             elif event_type == Quartz.kCGEventKeyUp:
                 if keycode == target_keycode and suppressed_keydown[0]:
                     suppressed_keydown[0] = False
-                    return None  # suppress matching key-up too
+                    return None
 
-            return event  # everything else passes through
+            return event
 
         mask = (
             Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
@@ -239,7 +328,7 @@ class PlumeApp(rumps.App):
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
-            Quartz.kCGEventTapOptionDefault,  # active tap: can suppress events
+            Quartz.kCGEventTapOptionDefault,
             mask,
             tap_callback,
             None,
@@ -256,7 +345,6 @@ class PlumeApp(rumps.App):
         local_tap[0] = tap
         source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
 
-        # Store references so they don't get garbage-collected
         self._tap = tap
         self._tap_source = source
 
@@ -269,33 +357,28 @@ class PlumeApp(rumps.App):
             Quartz.CGEventTapEnable(tap, True)
             ready.set()
             Quartz.CFRunLoopRun()
-            # Clean up closure ref when thread exits
             local_tap[0] = None
 
         t = threading.Thread(target=run_tap, daemon=True)
         t.start()
         self._tap_thread = t
-        ready.wait(timeout=2.0)  # ensure run loop is spinning before returning
+        ready.wait(timeout=2.0)
 
     @objc.python_method
     def _stop_hotkey_listener(self):
-        # 1. Disable the tap so no more callbacks fire
         if self._tap is not None:
             try:
                 Quartz.CGEventTapEnable(self._tap, False)
             except Exception:
                 pass
 
-        # 2. Stop the run loop so the thread exits
         if self._tap_loop is not None:
             Quartz.CFRunLoopStop(self._tap_loop)
 
-        # 3. Wait for the thread to actually finish
         if self._tap_thread is not None:
             self._tap_thread.join(timeout=2.0)
             self._tap_thread = None
 
-        # 4. Now safe to release — nothing references these anymore
         self._tap_loop = None
         self._tap_source = None
         self._tap = None
@@ -308,6 +391,8 @@ class PlumeApp(rumps.App):
     # ── Recording toggle ──
 
     def _toggle(self):
+        if not self._model_ready:
+            return
         with self.lock:
             if self.recording:
                 self._stop_and_transcribe()
@@ -316,13 +401,25 @@ class PlumeApp(rumps.App):
 
     def _start_recording(self):
         self.audio_data = []
-        self.stream = sd.InputStream(
-            samplerate=NATIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            callback=self._audio_cb,
-        )
-        self.stream.start()
+        try:
+            native_rate = _get_native_sample_rate()
+            self.stream = sd.InputStream(
+                samplerate=native_rate,
+                channels=CHANNELS,
+                dtype="float32",
+                callback=self._audio_cb,
+            )
+            self.stream.start()
+        except Exception as e:
+            print(f"[audio] failed to open mic: {e}", flush=True)
+            self._set_idle("Mic unavailable")
+            rumps.notification(
+                title="Plume",
+                subtitle="Cannot open microphone",
+                message=str(e),
+            )
+            return
+        self._native_rate = native_rate
         self.recording = True
         if self._settings.get("sound_effects", True):
             play_sound("Tink")
@@ -349,11 +446,11 @@ class PlumeApp(rumps.App):
             return
 
         audio = np.concatenate(self.audio_data, axis=0)
-        if len(audio) < NATIVE_SAMPLE_RATE * 0.3:
+        if len(audio) < self._native_rate * 0.3:
             self._set_idle("Too short")
             return
 
-        audio = _resample(audio, NATIVE_SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+        audio = _resample(audio, self._native_rate, WHISPER_SAMPLE_RATE)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         try:
@@ -373,7 +470,7 @@ class PlumeApp(rumps.App):
 
                 if s.get("auto_paste", True):
                     if not s.get("copy_to_clipboard", True):
-                        copy_to_clipboard(text)  # need clipboard for paste
+                        copy_to_clipboard(text)
                     pasted = simulate_paste()
                     if not pasted:
                         rumps.notification(
@@ -431,10 +528,12 @@ def main():
     _ensure_single_instance()
 
     if not WHISPER_BIN:
-        rumps.alert(title="Plume", message="whisper-cli not found.\nRun: bash setup.sh")
-        sys.exit(1)
-    if not os.path.isfile(MODEL_PATH):
-        rumps.alert(title="Plume", message="Model not found.\nRun: bash setup.sh")
+        rumps.alert(
+            title="Plume",
+            message="whisper-cli not found.\n"
+                    "Run: bash setup.sh" if not _FROZEN else
+                    "The app bundle is incomplete — please re-download.",
+        )
         sys.exit(1)
 
     PlumeApp().run()
