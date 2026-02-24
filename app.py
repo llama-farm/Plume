@@ -22,10 +22,11 @@ import objc
 import Quartz
 from AppKit import (
     NSBackingStoreBuffered, NSColor, NSMakeRect,
-    NSObject as _NSObject, NSScreen, NSView, NSWindow,
+    NSObject as _NSObject, NSPasteboard, NSScreen, NSSound, NSView, NSWindow,
 )
 
 import settings as cfg
+import onboarding
 
 # ── Path resolution ───────────────────────────────────────────
 
@@ -91,6 +92,10 @@ def _resample(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray
 
 def _download_model(progress_cb=None):
     """Download the whisper model to MODEL_PATH. Calls progress_cb(percent)."""
+    if os.path.isfile(MODEL_PATH):
+        if progress_cb:
+            progress_cb(100)
+        return
     os.makedirs(MODEL_DIR, exist_ok=True)
     tmp_path = MODEL_PATH + ".download"
 
@@ -159,18 +164,23 @@ def run_whisper(wav_path: str) -> str:
 
 
 def copy_to_clipboard(text: str):
-    proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-    proc.communicate(text.encode("utf-8"))
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    pb.setString_forType_(text, "public.utf8-plain-text")
 
 
 def simulate_paste() -> bool:
     time.sleep(0.05)
-    result = subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to keystroke "v" using command down'],
-        capture_output=True, text=True,
-    )
-    return result.returncode == 0
+    try:
+        down = Quartz.CGEventCreateKeyboardEvent(None, 9, True)  # 9 = 'V'
+        Quartz.CGEventSetFlags(down, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        up = Quartz.CGEventCreateKeyboardEvent(None, 9, False)
+        Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        return True
+    except Exception:
+        return False
 
 
 def type_text(text):
@@ -188,8 +198,9 @@ def type_text(text):
 def play_sound(name: str):
     path = f"/System/Library/Sounds/{name}.aiff"
     if os.path.exists(path):
-        subprocess.Popen(["afplay", path],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sound = NSSound.alloc().initWithContentsOfFile_byReference_(path, True)
+        if sound:
+            sound.play()
 
 
 # ── Menu bar app ──────────────────────────────────────────────
@@ -299,6 +310,20 @@ class _RecordingGlow(_NSObject):
         self._smoothed = 0.0
         self._rms_accum = 0.0
         self._rms_count = 0
+        # Move glow to the screen with the mouse cursor
+        active = NSScreen.mainScreen()
+        mouse = Quartz.NSEvent.mouseLocation()
+        for s in NSScreen.screens():
+            if Quartz.NSPointInRect(mouse, s.frame()):
+                active = s
+                break
+        frame = active.frame()
+        glow_h = 64
+        self._window.setFrame_display_(
+            NSMakeRect(frame.origin.x, frame.origin.y + frame.size.height - glow_h,
+                       frame.size.width, glow_h),
+            True,
+        )
         self._window.orderFront_(None)
         NSTimer = objc.lookUpClass("NSTimer")
         self._timer = (
@@ -353,9 +378,9 @@ class _RecordingGlow(_NSObject):
         # ── 5. Map to visual: base + center opacity, vertical spread ──
         v = self._smoothed
 
-        # Base layer: dim idle state, brightens with voice
+        # Base layer: always-visible idle glow, brightens with voice
         if self._base_layer:
-            self._base_layer.setOpacity_(0.15 + v * 0.85)
+            self._base_layer.setOpacity_(0.35 + v * 0.65)
 
         if self._center_layer:
             self._center_layer.setOpacity_(v)
@@ -387,12 +412,14 @@ class _RecordingGlow(_NSObject):
 class PlumeApp(rumps.App):
     def __init__(self):
         super().__init__(
-            name="Plume",
+            name="Plume - AI Dictation",
             icon=ICON_IDLE,
             template=True,
             quit_button=None,
         )
 
+        # Snapshot before load() which may migrate legacy settings into place
+        self._is_fresh_install = not os.path.isfile(cfg.SETTINGS_FILE) and not os.path.isfile(cfg._LEGACY_SETTINGS_FILE)
         self._settings = cfg.load()
         self.recording = False
         self.audio_data: list[np.ndarray] = []
@@ -424,6 +451,9 @@ class PlumeApp(rumps.App):
         self.status_item = rumps.MenuItem(status_text)
         self.status_item.set_callback(None)
 
+        self._onboarding_ctrl = None
+        self._download_thread = None
+
         self.menu = [
             self.status_item,
             None,
@@ -432,30 +462,93 @@ class PlumeApp(rumps.App):
             rumps.MenuItem("Quit Plume", callback=self._quit),
         ]
 
-        self._start_hotkey_listener()
+        # Onboarding gate: show wizard on first launch, skip for existing users
+        if not self._settings.get("onboarding_complete", False):
+            if not self._is_fresh_install:
+                # Existing user upgrading — silently mark complete
+                self._settings["onboarding_complete"] = True
+                cfg.save(self._settings)
+                self._finish_setup()
+            else:
+                # Start model download immediately so it runs during onboarding
+                if not self._model_ready:
+                    self._download_thread = threading.Thread(
+                        target=self._download_model_bg, daemon=True,
+                    )
+                    self._download_thread.start()
+                # Defer show to after the run loop starts via a one-shot rumps.Timer
+                self._onboarding_timer = rumps.Timer(self._deferred_show_onboarding, 0.5)
+                self._onboarding_timer.start()
+        else:
+            self._finish_setup()
 
-        if not self._model_ready:
-            threading.Thread(target=self._download_model_bg, daemon=True).start()
+    # ── Onboarding ──
+
+    @objc.python_method
+    def _deferred_show_onboarding(self, _timer):
+        """One-shot timer callback: create and show the onboarding wizard."""
+        self._onboarding_timer.stop()
+        self._onboarding_ctrl = (
+            onboarding.OnboardingWindowController.alloc()
+            .initWithCallback_(self._on_onboarding_complete)
+        )
+        self._onboarding_ctrl.show()
+        if self._model_ready:
+            self._onboarding_ctrl.downloadComplete_(None)
+
+    @objc.python_method
+    def _on_onboarding_complete(self):
+        self._settings = cfg.load()
+        self._finish_setup()
+
+    @objc.python_method
+    def _finish_setup(self):
+        self._start_hotkey_listener()
+        if not self._model_ready and (
+            self._download_thread is None or not self._download_thread.is_alive()
+        ):
+            self._download_thread = threading.Thread(
+                target=self._download_model_bg, daemon=True,
+            )
+            self._download_thread.start()
 
     # ── Model download ──
 
     def _download_model_bg(self):
+        from Foundation import NSNumber, NSString
+
         def on_progress(pct):
             self.status_item.title = f"Downloading speech model... {pct}%"
+            ctrl = self._onboarding_ctrl
+            if ctrl is not None:
+                ctrl.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "updateDownloadProgress:", NSNumber.numberWithInt_(pct), False,
+                )
 
         try:
             _download_model(progress_cb=on_progress)
             self._model_ready = True
+            ctrl = self._onboarding_ctrl
+            if ctrl is not None:
+                ctrl.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "downloadComplete:", None, False,
+                )
             self._set_idle("Ready")
             rumps.notification(
-                title="Plume",
+                title="Plume - AI Dictation",
                 subtitle="Speech model downloaded",
                 message="You're all set — use your hotkey to start dictating.",
             )
         except Exception as e:
+            ctrl = self._onboarding_ctrl
+            if ctrl is not None:
+                err_str = NSString.stringWithString_(f"Download failed: {str(e)[:120]}")
+                ctrl.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "downloadFailed:", err_str, False,
+                )
             self.status_item.title = "Model download failed"
             rumps.notification(
-                title="Plume",
+                title="Plume - AI Dictation",
                 subtitle="Model download failed",
                 message=str(e)[:200],
             )
@@ -540,7 +633,7 @@ class PlumeApp(rumps.App):
 
         if tap is None:
             rumps.notification(
-                title="Plume",
+                title="Plume - AI Dictation",
                 subtitle="Cannot register hotkey",
                 message="Grant Accessibility permission in System Settings",
             )
@@ -620,7 +713,7 @@ class PlumeApp(rumps.App):
             print(f"[audio] failed to open mic: {e}", flush=True)
             self._set_idle("Mic unavailable")
             rumps.notification(
-                title="Plume",
+                title="Plume - AI Dictation",
                 subtitle="Cannot open microphone",
                 message=str(e),
             )
@@ -755,7 +848,7 @@ class PlumeApp(rumps.App):
                     pasted = simulate_paste()
                     if not pasted:
                         rumps.notification(
-                            title="Plume — Paste Failed",
+                            title="Plume - AI Dictation",
                             subtitle="Text is on your clipboard (Cmd+V)",
                             message="Enable Accessibility: System Settings → "
                                     "Privacy & Security → Accessibility → Plume",
