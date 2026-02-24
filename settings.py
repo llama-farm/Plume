@@ -4,6 +4,7 @@ Plume settings — persistence + native macOS settings window.
 
 import json
 import os
+import shutil
 import threading
 
 import objc
@@ -121,8 +122,10 @@ def hotkey_to_pynput(flags, keycode):
 
 # ── Settings persistence ──────────────────────────────────────
 
-SETTINGS_DIR = os.path.expanduser("~/.config/plume")
+SETTINGS_DIR = os.path.expanduser("~/Library/Application Support/Plume")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
+
+_LEGACY_SETTINGS_FILE = os.path.expanduser("~/.config/plume/settings.json")
 
 DEFAULTS = {
     "hotkey_keycode": 0x35,      # Escape
@@ -132,11 +135,17 @@ DEFAULTS = {
     "sound_effects": True,
     "live_transcription": False,
     "recording_glow": True,
+    "onboarding_complete": False,
 }
 
 
 def load():
     """Load settings from disk, merged with defaults."""
+    # One-time migration from legacy path
+    if not os.path.isfile(SETTINGS_FILE) and os.path.isfile(_LEGACY_SETTINGS_FILE):
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        shutil.copy2(_LEGACY_SETTINGS_FILE, SETTINGS_FILE)
+
     if os.path.isfile(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE) as f:
