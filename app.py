@@ -92,6 +92,10 @@ def _resample(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray
 
 def _download_model(progress_cb=None):
     """Download the whisper model to MODEL_PATH. Calls progress_cb(percent)."""
+    if os.path.isfile(MODEL_PATH):
+        if progress_cb:
+            progress_cb(100)
+        return
     os.makedirs(MODEL_DIR, exist_ok=True)
     tmp_path = MODEL_PATH + ".download"
 
@@ -306,6 +310,20 @@ class _RecordingGlow(_NSObject):
         self._smoothed = 0.0
         self._rms_accum = 0.0
         self._rms_count = 0
+        # Move glow to the screen with the mouse cursor
+        active = NSScreen.mainScreen()
+        mouse = Quartz.NSEvent.mouseLocation()
+        for s in NSScreen.screens():
+            if Quartz.NSPointInRect(mouse, s.frame()):
+                active = s
+                break
+        frame = active.frame()
+        glow_h = 64
+        self._window.setFrame_display_(
+            NSMakeRect(frame.origin.x, frame.origin.y + frame.size.height - glow_h,
+                       frame.size.width, glow_h),
+            True,
+        )
         self._window.orderFront_(None)
         NSTimer = objc.lookUpClass("NSTimer")
         self._timer = (
@@ -360,9 +378,9 @@ class _RecordingGlow(_NSObject):
         # ── 5. Map to visual: base + center opacity, vertical spread ──
         v = self._smoothed
 
-        # Base layer: dim idle state, brightens with voice
+        # Base layer: always-visible idle glow, brightens with voice
         if self._base_layer:
-            self._base_layer.setOpacity_(0.15 + v * 0.85)
+            self._base_layer.setOpacity_(0.35 + v * 0.65)
 
         if self._center_layer:
             self._center_layer.setOpacity_(v)
@@ -475,6 +493,8 @@ class PlumeApp(rumps.App):
             .initWithCallback_(self._on_onboarding_complete)
         )
         self._onboarding_ctrl.show()
+        if self._model_ready:
+            self._onboarding_ctrl.downloadComplete_(None)
 
     @objc.python_method
     def _on_onboarding_complete(self):

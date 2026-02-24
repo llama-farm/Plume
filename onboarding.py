@@ -2,6 +2,7 @@
 Plume onboarding — first-launch wizard for permissions and usage intro.
 """
 
+import ctypes
 import os
 import sys
 import subprocess
@@ -88,6 +89,10 @@ def _multiline_label(text, frame, size=13, color=None, alignment=0):
 def _check_mic_permission():
     """Return True if microphone access is granted."""
     try:
+        objc.loadBundle(
+            "AVFoundation", {},
+            bundle_path="/System/Library/Frameworks/AVFoundation.framework",
+        )
         AVCaptureDevice = objc.lookUpClass("AVCaptureDevice")
         status = AVCaptureDevice.authorizationStatusForMediaType_("soun")
         return status == 3  # AVAuthorizationStatusAuthorized
@@ -98,9 +103,29 @@ def _check_mic_permission():
 def _check_accessibility_permission():
     """Return True if accessibility access is granted."""
     try:
-        return bool(Quartz.AXIsProcessTrusted())
+        AS = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        AS.AXIsProcessTrusted.restype = ctypes.c_bool
+        AS.AXIsProcessTrusted.argtypes = []
+        return AS.AXIsProcessTrusted()
     except Exception:
         return False
+
+
+def _prompt_accessibility():
+    """Trigger the system accessibility prompt, adding the app to the list."""
+    try:
+        from Foundation import NSDictionary
+        options = NSDictionary.dictionaryWithObject_forKey_(True, "AXTrustedCheckOptionPrompt")
+        AS = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        AS.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+        AS.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+        AS.AXIsProcessTrustedWithOptions(objc.pyobjc_id(options))
+    except Exception:
+        pass
 
 
 # ── Onboarding window controller ────────────────────────────
@@ -608,14 +633,13 @@ class OnboardingWindowController(NSObject):
             pass
 
     def accClicked_(self, sender):
-        """Open Accessibility settings in System Preferences."""
-        try:
-            subprocess.Popen([
-                "open",
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-            ])
-        except Exception:
-            pass
+        """Prompt for Accessibility access (adds app to the list)."""
+        # Lower window so the system prompt isn't hidden behind us
+        self.window.setLevel_(0)  # NSNormalWindowLevel
+        _prompt_accessibility()
+
+    def restoreWindowLevel_(self, _):
+        self.window.setLevel_(NSFloatingWindowLevel)
 
     def bgClicked_(self, sender):
         """'Continue in Background' — close wizard, download continues."""
