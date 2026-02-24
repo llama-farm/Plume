@@ -434,6 +434,7 @@ class PlumeApp(rumps.App):
         self.status_item.set_callback(None)
 
         self._onboarding_ctrl = None
+        self._download_thread = None
 
         self.menu = [
             self.status_item,
@@ -451,6 +452,12 @@ class PlumeApp(rumps.App):
                 cfg.save(self._settings)
                 self._finish_setup()
             else:
+                # Start model download immediately so it runs during onboarding
+                if not self._model_ready:
+                    self._download_thread = threading.Thread(
+                        target=self._download_model_bg, daemon=True,
+                    )
+                    self._download_thread.start()
                 # Defer show to after the run loop starts via a one-shot rumps.Timer
                 self._onboarding_timer = rumps.Timer(self._deferred_show_onboarding, 0.5)
                 self._onboarding_timer.start()
@@ -477,18 +484,35 @@ class PlumeApp(rumps.App):
     @objc.python_method
     def _finish_setup(self):
         self._start_hotkey_listener()
-        if not self._model_ready:
-            threading.Thread(target=self._download_model_bg, daemon=True).start()
+        if not self._model_ready and (
+            self._download_thread is None or not self._download_thread.is_alive()
+        ):
+            self._download_thread = threading.Thread(
+                target=self._download_model_bg, daemon=True,
+            )
+            self._download_thread.start()
 
     # ── Model download ──
 
     def _download_model_bg(self):
+        from Foundation import NSNumber, NSString
+
         def on_progress(pct):
             self.status_item.title = f"Downloading speech model... {pct}%"
+            ctrl = self._onboarding_ctrl
+            if ctrl is not None:
+                ctrl.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "updateDownloadProgress:", NSNumber.numberWithInt_(pct), False,
+                )
 
         try:
             _download_model(progress_cb=on_progress)
             self._model_ready = True
+            ctrl = self._onboarding_ctrl
+            if ctrl is not None:
+                ctrl.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "downloadComplete:", None, False,
+                )
             self._set_idle("Ready")
             rumps.notification(
                 title="Plume - AI Dictation",
@@ -496,6 +520,12 @@ class PlumeApp(rumps.App):
                 message="You're all set — use your hotkey to start dictating.",
             )
         except Exception as e:
+            ctrl = self._onboarding_ctrl
+            if ctrl is not None:
+                err_str = NSString.stringWithString_(f"Download failed: {str(e)[:120]}")
+                ctrl.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "downloadFailed:", err_str, False,
+                )
             self.status_item.title = "Model download failed"
             rumps.notification(
                 title="Plume - AI Dictation",

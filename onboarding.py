@@ -22,6 +22,8 @@ from AppKit import (
     NSImageView,
     NSMakeRect,
     NSObject,
+    NSProgressIndicator,
+    NSProgressIndicatorBarStyle,
     NSTextField,
     NSView,
     NSWindow,
@@ -121,6 +123,9 @@ class OnboardingWindowController(NSObject):
         self._poll_timer = None
         self._mic_status = None
         self._acc_status = None
+        self._dl_progress = None
+        self._dl_status = None
+        self._bg_btn = None
         self._completed = False
         self._build_window()
         return self
@@ -315,7 +320,7 @@ class OnboardingWindowController(NSObject):
         )
         page.addSubview_(title)
 
-        y -= 20
+        y -= 12
 
         steps = [
             ("1", "start recording", "speak",
@@ -331,10 +336,10 @@ class OnboardingWindowController(NSObject):
         text_x = badge_x + badge_size + 14
         text_w = W - text_x - PAD - 8
         heading_h = 20
-        detail_h = 36
+        detail_h = 30
 
         for num, hotkey_action, hotkey_verb, detail in steps:
-            y -= 18
+            y -= 10
 
             # Heading top is at y
             heading_y = y - heading_h
@@ -394,7 +399,51 @@ class OnboardingWindowController(NSObject):
             )
             page.addSubview_(detail_lbl)
 
-            y -= detail_h + 8
+            y -= detail_h + 2
+
+        # ── Download progress UI ──
+        y -= 6
+        bar_x = PAD + 12
+        bar_w = W - 2 * (PAD + 12)
+
+        dl_label = _label(
+            "Downloading model",
+            NSMakeRect(bar_x, y - 14, bar_w, 14),
+            size=11, bold=True,
+        )
+        page.addSubview_(dl_label)
+        y -= 16
+
+        self._dl_progress = NSProgressIndicator.alloc().initWithFrame_(
+            NSMakeRect(bar_x, y - 14, bar_w, 14)
+        )
+        self._dl_progress.setStyle_(NSProgressIndicatorBarStyle)
+        self._dl_progress.setIndeterminate_(False)
+        self._dl_progress.setMinValue_(0)
+        self._dl_progress.setMaxValue_(100)
+        self._dl_progress.setDoubleValue_(0)
+        page.addSubview_(self._dl_progress)
+        y -= 18
+
+        self._dl_status = _label(
+            "Downloading speech model...",
+            NSMakeRect(bar_x, y - 14, bar_w, 14),
+            size=11, color=NSColor.secondaryLabelColor(),
+        )
+        page.addSubview_(self._dl_status)
+        y -= 16
+
+        self._bg_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(bar_x, y - 18, 180, 18)
+        )
+        self._bg_btn.setTitle_("Continue in Background")
+        self._bg_btn.setBezelStyle_(0)  # borderless
+        self._bg_btn.setBordered_(False)
+        self._bg_btn.setFont_(NSFont.systemFontOfSize_(12))
+        self._bg_btn.setContentTintColor_(BRAND_COLOR)
+        self._bg_btn.setTarget_(self)
+        self._bg_btn.setAction_(objc.selector(self.bgClicked_, signature=b"v@:@"))
+        page.addSubview_(self._bg_btn)
 
         return page
 
@@ -567,6 +616,43 @@ class OnboardingWindowController(NSObject):
             ])
         except Exception:
             pass
+
+    def bgClicked_(self, sender):
+        """'Continue in Background' — close wizard, download continues."""
+        self._complete()
+
+    # ── Download progress (called from app.py via performSelectorOnMainThread) ──
+
+    def updateDownloadProgress_(self, pct_number):
+        """Update download bar + label. pct_number is an NSNumber (0-100)."""
+        pct = int(pct_number.intValue())
+        if self._dl_progress:
+            self._dl_progress.setDoubleValue_(pct)
+        if self._dl_status:
+            self._dl_status.setStringValue_(f"Downloading speech model... {pct}%")
+
+    def downloadComplete_(self, _ignored):
+        """Show download-complete state on page 3."""
+        if self._dl_progress:
+            self._dl_progress.setDoubleValue_(100)
+        if self._dl_status:
+            self._dl_status.setStringValue_("Download complete!")
+            self._dl_status.setTextColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.2, 0.7, 0.3, 1.0)
+            )
+        if self._bg_btn:
+            self._bg_btn.setHidden_(True)
+
+    def downloadFailed_(self, error_msg):
+        """Show error state on page 3. error_msg is an NSString."""
+        msg = str(error_msg) if error_msg else "Download failed"
+        if self._dl_status:
+            self._dl_status.setStringValue_(msg)
+            self._dl_status.setTextColor_(NSColor.systemRedColor())
+        if self._dl_progress:
+            self._dl_progress.setDoubleValue_(0)
+        if self._bg_btn:
+            self._bg_btn.setHidden_(True)
 
     # ── Permission polling ──
 
